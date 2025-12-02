@@ -1,0 +1,191 @@
+USE clean_energy;
+
+SELECT * FROM complete_renewable_energy_dataset;
+
+CREATE VIEW ENERGY1 AS(
+    SELECT 
+        `Country` AS `COUNTRY`,
+        `Year` AS `YEAR`,
+        `Energy Type` AS `ENERGY_TYPE`,
+        `Production (GWh)` AS `PRODUCTION_GWH`,
+        `Installed Capacity (MW)` AS `INSTALLED_CAPACITY_MW`,
+        `Investments (USD)` AS `INVESTMENTS`
+    FROM
+        complete_renewable_energy_dataset
+);
+
+
+
+CREATE OR REPLACE VIEW aggregated_data AS (
+    SELECT 
+        COUNTRY,
+        ENERGY_TYPE,
+        YEAR,
+        SUM(INSTALLED_CAPACITY_MW) as TOTAL_CAPACITY_MW,
+        SUM(PRODUCTION_GWH)*1000 as TOTAL_PRODUCTION_MWH,
+        SUM(INVESTMENTS) as TOTAL_INVESTMENTS_USD
+    FROM ENERGY1
+    WHERE INSTALLED_CAPACITY_MW > 0 
+        AND INVESTMENTS > 0
+    GROUP BY COUNTRY, ENERGY_TYPE, YEAR
+);
+SELECT 
+    COUNTRY,
+    ENERGY_TYPE,
+    YEAR,
+    TOTAL_CAPACITY_MW,
+    TOTAL_PRODUCTION_MWH,
+    TOTAL_INVESTMENTS_USD,
+    -- Key metric: Cost per MW
+    ROUND(TOTAL_INVESTMENTS_USD / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as COST_PER_MW_USD,
+    -- Bonus: Production efficiency
+    ROUND(TOTAL_PRODUCTION_MWH / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as PRODUCTION_EFFICIENCY
+FROM aggregated_data
+ORDER BY YEAR DESC, COUNTRY, ENERGY_TYPE;
+
+
+
+-- ==========================
+-- QUERY 2: TECHNOLOGY COMPARISON - Which tech is cheapest?
+-- ==========================
+
+WITH tech_summary AS (
+    SELECT 
+        ENERGY_TYPE,
+        COUNTRY,
+        YEAR,
+        TOTAL_CAPACITY_MW,
+        TOTAL_INVESTMENTS_USD,
+        TOTAL_INVESTMENTS_USD / NULLIF(TOTAL_CAPACITY_MW, 0) AS COST_PER_MW
+    FROM aggregated_data
+)
+SELECT 
+    ENERGY_TYPE,
+    COUNT(DISTINCT COUNTRY) as NUM_COUNTRIES,
+    COUNT(DISTINCT YEAR) as NUM_YEARS,
+    ROUND(AVG(COST_PER_MW), 2) as AVG_COST_PER_MW,
+    ROUND(MIN(COST_PER_MW), 2) as MIN_COST_PER_MW,
+    ROUND(MAX(COST_PER_MW), 2) as MAX_COST_PER_MW,
+    ROUND(SUM(TOTAL_CAPACITY_MW), 2) as GLOBAL_CAPACITY_MW,
+    ROUND(SUM(TOTAL_INVESTMENTS_USD), 2) as GLOBAL_INVESTMENTS_USD
+FROM tech_summary
+GROUP BY ENERGY_TYPE
+ORDER BY AVG_COST_PER_MW ASC;
+
+
+-- ==========================
+-- QUERY 3: REGIONAL COMPARISON - Which country invests most efficiently?
+-- ==========================
+
+WITH country_summary AS (
+    SELECT 
+        COUNTRY,
+        SUM(TOTAL_CAPACITY_MW) as TOTAL_CAPACITY_MW,
+        SUM(TOTAL_INVESTMENTS_USD) as TOTAL_INVESTMENTS_USD
+    FROM aggregated_data
+    GROUP BY COUNTRY
+)
+SELECT 
+    COUNTRY,
+    ROUND(TOTAL_INVESTMENTS_USD / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as AVG_COST_PER_MW,
+	FORMAT(TOTAL_CAPACITY_MW, 2, 'en_US') AS TOTAL_CAPACITY_MW,
+    -- there's no 'FORMAT' in Snowflake, use 'TO_CHAR' instead
+    FORMAT(TOTAL_INVESTMENTS_USD,'###,##0') AS TOTAL_INVESTMENTS_USD,
+    -- Calculate percentage of global investment
+    ROUND(TOTAL_INVESTMENTS_USD / SUM(TOTAL_INVESTMENTS_USD) OVER () * 100, 2) as PCT_OF_GLOBAL_INVESTMENT
+FROM country_summary
+ORDER BY AVG_COST_PER_MW ASC;
+
+
+-- ==========================
+-- QUERY 4: TIME EVOLUTION - How costs changed over years
+-- ==========================
+
+WITH yearly_costs AS (
+    SELECT 
+        country,YEAR,
+        ENERGY_TYPE,
+        TOTAL_CAPACITY_MW,
+        TOTAL_INVESTMENTS_USD,
+        ROUND(TOTAL_INVESTMENTS_USD / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as COST_PER_MW_USD
+    FROM aggregated_data
+)
+SELECT 
+    country,YEAR,
+    ENERGY_TYPE,
+    COST_PER_MW_USD,
+    ROUND(TOTAL_CAPACITY_MW, 2) as TOTAL_CAPACITY_MW,
+    -- Compare to previous year
+    LAG(COST_PER_MW_USD) OVER (PARTITION BY ENERGY_TYPE ORDER BY YEAR) as PREV_YEAR_COST,
+    -- Cost change amount
+    ROUND(COST_PER_MW_USD - LAG(COST_PER_MW_USD) OVER (PARTITION BY ENERGY_TYPE ORDER BY YEAR), 2) as COST_CHANGE_USD,
+    -- Cost change percentage
+    ROUND(
+        (COST_PER_MW_USD - LAG(COST_PER_MW_USD) OVER (PARTITION BY ENERGY_TYPE ORDER BY YEAR)) / 
+        NULLIF(LAG(COST_PER_MW_USD) OVER (PARTITION BY ENERGY_TYPE ORDER BY YEAR), 0) * 100
+    , 2) as COST_CHANGE_PCT
+FROM yearly_costs
+ORDER BY ENERGY_TYPE, YEAR;
+
+
+-- ==========================
+-- QUERY 5: DASHBOARD VIEW - Complete summary table
+-- ==========================
+
+WITH metrics AS (
+    SELECT 
+        COUNTRY,
+        ENERGY_TYPE,
+        YEAR,
+        TOTAL_INVESTMENTS_USD,
+        TOTAL_CAPACITY_MW,
+        TOTAL_PRODUCTION_MWH,
+        ROUND(TOTAL_INVESTMENTS_USD / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as COST_PER_MW,
+        ROUND(TOTAL_PRODUCTION_MWH / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as EQUIVALENT_HOURS
+    FROM aggregated_data
+)
+SELECT 
+    COUNTRY,
+    ENERGY_TYPE,
+    YEAR,
+    FORMAT(TOTAL_INVESTMENTS_USD, 2, 'en_US') as TOTAL_INVESTMENTS_USD,
+    ROUND(TOTAL_CAPACITY_MW, 2) as TOTAL_CAPACITY_MW,
+    ROUND(TOTAL_PRODUCTION_MWH/1000, 2) as TOTAL_PRODUCTION_GWH,
+    COST_PER_MW,
+    EQUIVALENT_HOURS,
+    -- Ranking within technology type
+    RANK() OVER (PARTITION BY ENERGY_TYPE, YEAR ORDER BY COST_PER_MW ASC) as COST_RANK_BY_TECH,
+    -- Market share
+    ROUND(TOTAL_CAPACITY_MW / SUM(TOTAL_CAPACITY_MW) OVER (PARTITION BY YEAR, ENERGY_TYPE) * 100, 2) as MARKET_SHARE_PCT
+FROM metrics
+ORDER BY YEAR DESC, ENERGY_TYPE, COST_PER_MW ASC;
+
+
+-- ==========================
+-- QUERY 6: BEST VALUE ANALYSIS - ROI perspective
+-- ==========================
+
+WITH efficiency_metrics AS (
+    SELECT 
+        COUNTRY,
+        ENERGY_TYPE,
+        YEAR,
+        TOTAL_INVESTMENTS_USD,
+        TOTAL_CAPACITY_MW,
+        TOTAL_PRODUCTION_MWH,
+        ROUND(TOTAL_INVESTMENTS_USD / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as COST_PER_MW,
+        ROUND(TOTAL_PRODUCTION_MWH / NULLIF(TOTAL_CAPACITY_MW, 0), 2) as PRODUCTION_PER_MW
+    FROM aggregated_data
+)
+SELECT 
+    COUNTRY,
+    ENERGY_TYPE,
+    YEAR,
+    COST_PER_MW,
+    PRODUCTION_PER_MW,
+    -- Value score: production efficiency divided by cost
+    ROUND(PRODUCTION_PER_MW / NULLIF(COST_PER_MW, 0) * 1000, 4) as VALUE_SCORE,
+    RANK() OVER (ORDER BY PRODUCTION_PER_MW / NULLIF(COST_PER_MW, 0) DESC) as VALUE_RANK
+FROM efficiency_metrics
+ORDER BY VALUE_RANK
+LIMIT 20;
